@@ -1,0 +1,484 @@
+"""
+LEO SATELLITE ORBITAL STATE DETERMINATION PROCEDURE
+Day 2: State Determination with Atmospheric Drag Compensation
+
+Mission: Determine position and velocity of LEO satellites accounting for
+         atmospheric drag and gravitational perturbations
+Standard: ESA/NASA Mission Operations using SGP4 algorithm
+Author: Training Exercise
+Date: 2025-10-02
+
+PROCEDURE OVERVIEW:
+This procedure implements the SGP4 (Simplified General Perturbations 4) algorithm
+for accurately propagating Low Earth Orbit satellite positions. Unlike GEO
+satellites, LEO satellites experience significant atmospheric drag and require
+specialized propagation models.
+
+KEY DIFFERENCES FROM GEO:
+- Atmospheric drag causes continuous orbital decay
+- Earth's oblateness (J2 perturbation) significantly affects orbit
+- Orbit period is ~90 minutes vs 24 hours for GEO
+- Position prediction accuracy degrades much faster
+- Requires more frequent TLE updates (daily vs weekly)
+
+WHY SGP4?
+SGP4 is the international standard for satellite tracking. It was developed by
+NORAD and models the primary perturbations affecting LEO satellites without
+requiring expensive numerical integration. All TLE data is designed to work
+with SGP4/SDP4 propagators.
+"""
+
+import math
+from datetime import datetime, timedelta
+
+# =============================================================================
+# SECTION 1: FUNDAMENTAL CONSTANTS AND PARAMETERS
+# =============================================================================
+
+class Constants:
+    """
+    Physical and mathematical constants used in SGP4 algorithm.
+    
+    WHY THESE VALUES?
+    These are defined by international standards (WGS-84 for Earth model,
+    IAU for astronomical constants). Using wrong values here would cause
+    position errors of kilometers.
+    """
+    # Earth parameters (WGS-84 model)
+    EARTH_RADIUS = 6378.137  # km, equatorial radius
+    EARTH_FLATTENING = 1.0 / 298.257223563  # Earth's oblateness
+    MU_EARTH = 398600.4418  # km^3/s^2, Earth's gravitational parameter
+    J2 = 0.00108262998905  # Earth's second zonal harmonic (oblateness effect)
+    J3 = -0.00000253215306  # Third zonal harmonic (pear-shaped effect)
+    J4 = -0.00000161098761  # Fourth zonal harmonic
+    
+    # Time conversion
+    MINUTES_PER_DAY = 1440.0
+    SECONDS_PER_DAY = 86400.0
+    
+    # Atmospheric drag parameters
+    # These model how drag varies with altitude and solar activity
+    KE = 0.0743669161  # Derived from Earth's radius and gravitational parameter
+
+# =============================================================================
+# SECTION 2: TLE PARSING FOR LEO SATELLITES
+# =============================================================================
+
+def parse_leo_tle(tle_line0, tle_line1, tle_line2):
+    """
+    Parse TLE specifically for LEO satellites, extracting drag terms.
+    
+    Args:
+        tle_line0: Satellite name line (optional but useful for identification)
+        tle_line1: First line containing epoch and drag terms
+        tle_line2: Second line containing orbital elements
+    
+    Returns:
+        Dictionary with orbital elements and LEO-specific parameters
+        
+    DIFFERENCE FROM GEO:
+    For LEO, we must extract the ballistic coefficient (BSTAR) which models
+    atmospheric drag. This term is nearly zero for GEO and critical for LEO.
+    We also track the first and second derivatives of mean motion, which
+    indicate how quickly drag is changing the orbit.
+    """
+    
+    # Extract satellite name if provided
+    sat_name = tle_line0.strip() if tle_line0 else "Unknown"
+    
+    # LINE 1: Epoch and drag terms
+    catalog_number = int(tle_line1[2:7])
+    
+    # Epoch year (handle Y2K)
+    epoch_year = int(tle_line1[18:20])
+    if epoch_year < 57:
+        epoch_year += 2000
+    else:
+        epoch_year += 1900
+    
+    epoch_day = float(tle_line1[20:32])
+    
+    # Mean motion derivatives (indicate orbital decay rate)
+    # First derivative: revs/day^2 (acceleration of orbital period)
+    mean_motion_dot = float(tle_line1[33:43])
+    
+    # Second derivative: revs/day^3 (rate of change of acceleration)
+    # This is in scientific notation but written strangely in TLE
+    mean_motion_ddot_str = tle_line1[44:52].strip()
+    if mean_motion_ddot_str:
+        # Convert from TLE's weird format: "12345-3" means 0.12345e-3
+        mantissa = float(mean_motion_ddot_str[0:6]) / 100000.0
+        exponent = int(mean_motion_ddot_str[6:8])
+        mean_motion_ddot = mantissa * (10.0 ** exponent)
+    else:
+        mean_motion_ddot = 0.0
+    
+    # BSTAR drag term (critical for LEO!)
+    # Models atmospheric drag effect on the satellite
+    bstar_str = tle_line1[53:61].strip()
+    if bstar_str:
+        mantissa = float(bstar_str[0:6]) / 100000.0
+        exponent = int(bstar_str[6:8])
+        bstar = mantissa * (10.0 ** exponent)
+    else:
+        bstar = 0.0
+    
+    # LINE 2: Orbital elements
+    inclination = float(tle_line2[8:16])  # degrees
+    raan = float(tle_line2[17:25])  # degrees
+    eccentricity = float('0.' + tle_line2[26:33])
+    arg_perigee = float(tle_line2[34:42])  # degrees
+    mean_anomaly = float(tle_line2[43:51])  # degrees
+    mean_motion = float(tle_line2[52:63])  # revolutions per day
+    revolution_number = int(tle_line2[63:68])  # orbit count at epoch
+    
+    # Convert epoch to datetime
+    epoch_datetime = datetime(epoch_year, 1, 1) + timedelta(days=epoch_day - 1)
+    
+    # Package everything
+    tle_data = {
+        'satellite_name': sat_name,
+        'catalog_number': catalog_number,
+        'epoch': epoch_datetime,
+        'mean_motion': mean_motion,
+        'mean_motion_dot': mean_motion_dot,
+        'mean_motion_ddot': mean_motion_ddot,
+        'bstar': bstar,
+        'inclination': inclination,
+        'raan': raan,
+        'eccentricity': eccentricity,
+        'arg_perigee': arg_perigee,
+        'mean_anomaly': mean_anomaly,
+        'revolution_number': revolution_number
+    }
+    
+    return tle_data
+
+# =============================================================================
+# SECTION 3: SIMPLIFIED SGP4 CORE ALGORITHM
+# =============================================================================
+
+def sgp4_propagate(tle_data, target_time):
+    """
+    Propagate LEO satellite position using simplified SGP4 algorithm.
+    
+    This is a teaching implementation that captures the essential physics
+    of SGP4 without all the edge case handling of operational implementations.
+    
+    Args:
+        tle_data: Dictionary from parse_leo_tle()
+        target_time: Datetime for desired position
+        
+    Returns:
+        Position and velocity vectors in TEME (True Equator Mean Equinox) frame
+        
+    ALGORITHM STRUCTURE:
+    1. Calculate time since epoch
+    2. Compute mean elements (affected by drag and J2)
+    3. Solve Kepler's equation for position in orbit
+    4. Apply perturbations (drag, oblateness)
+    5. Convert to position and velocity vectors
+    
+    WHY THIS IS COMPLEX:
+    LEO satellites are subject to forces that GEO satellites don't experience
+    significantly. We must model how atmospheric drag changes the orbit over
+    time, and how Earth's oblateness causes the orbital plane to precess.
+    """
+    
+    # Extract orbital elements and convert to radians
+    inc0 = math.radians(tle_data['inclination'])
+    raan0 = math.radians(tle_data['raan'])
+    ecc0 = tle_data['eccentricity']
+    argp0 = math.radians(tle_data['arg_perigee'])
+    M0 = math.radians(tle_data['mean_anomaly'])
+    n0 = tle_data['mean_motion'] * 2.0 * math.pi / Constants.MINUTES_PER_DAY
+    bstar = tle_data['bstar']
+    
+    # Calculate minutes since epoch
+    time_delta = (target_time - tle_data['epoch']).total_seconds() / 60.0
+    
+    # Recover original mean motion at epoch (undo SGP4's extraction)
+    a1 = (Constants.KE / n0) ** (2.0/3.0)  # Semi-major axis estimate
+    
+    # Calculate perigee and apogee altitudes
+    perigee = (a1 * (1.0 - ecc0) - 1.0) * Constants.EARTH_RADIUS
+    apogee = (a1 * (1.0 + ecc0) - 1.0) * Constants.EARTH_RADIUS
+    
+    # Compute J2 perturbations (Earth's oblateness effect)
+    temp = 1.5 * Constants.J2 * (Constants.EARTH_RADIUS / a1) ** 2
+    delta1 = temp * math.cos(inc0) ** 2
+    a0 = a1 * (1.0 - (1.0/3.0) * delta1 - delta1 ** 2 - (134.0/81.0) * delta1 ** 3)
+    delta0 = temp * math.cos(inc0) ** 2 / (a0 ** 2)
+    
+    # Recover mean motion (rad/min)
+    n0dp = n0 / (1.0 + delta0)
+    a0dp = a0 / (1.0 - delta0)
+    
+    # Update for secular effects of atmospheric drag and gravitation
+    # This models how the orbit changes over time
+    M = M0 + n0dp * time_delta  # Updated mean anomaly
+    omega = argp0  # Argument of perigee (would precess due to J2 in full SGP4)
+    Omega = raan0  # RAAN (would precess due to J2 in full SGP4)
+    ecc = ecc0  # Eccentricity (would decay due to drag in full SGP4)
+    inc = inc0  # Inclination (stable for LEO)
+    
+    # In full SGP4, we would apply secular and periodic perturbations here
+    # For teaching purposes, this simplified version shows the core structure
+    
+    # Solve Kepler's equation for eccentric anomaly
+    E = M
+    for iteration in range(10):
+        E_new = M + ecc * math.sin(E)
+        if abs(E_new - E) < 1e-12:
+            break
+        E = E_new
+    
+    # Calculate true anomaly
+    sin_nu = (math.sqrt(1.0 - ecc * ecc) * math.sin(E)) / (1.0 - ecc * math.cos(E))
+    cos_nu = (math.cos(E) - ecc) / (1.0 - ecc * math.cos(E))
+    nu = math.atan2(sin_nu, cos_nu)
+    
+    # Calculate radius and position in orbital plane
+    r = a0dp * (1.0 - ecc * math.cos(E))
+    
+    # Position in orbital plane
+    x_orb = r * cos_nu
+    y_orb = r * sin_nu
+    
+    # Velocity in orbital plane
+    n_prime = math.sqrt(Constants.MU_EARTH / (a0dp ** 3))
+    rdot = a0dp * ecc * math.sin(E) * n_prime / (1.0 - ecc * math.cos(E))
+    rfdot = a0dp * n_prime * math.sqrt(1.0 - ecc * ecc) / (1.0 - ecc * math.cos(E))
+    
+    # Transform to TEME (True Equator Mean Equinox) reference frame
+    # This requires three rotations using orbital elements
+    sin_omega = math.sin(omega)
+    cos_omega = math.cos(omega)
+    sin_Omega = math.sin(Omega)
+    cos_Omega = math.cos(Omega)
+    sin_i = math.sin(inc)
+    cos_i = math.cos(inc)
+    
+    # Rotation matrix elements
+    M11 = cos_Omega * cos_omega - sin_Omega * sin_omega * cos_i
+    M12 = -cos_Omega * sin_omega - sin_Omega * cos_omega * cos_i
+    M21 = sin_Omega * cos_omega + cos_Omega * sin_omega * cos_i
+    M22 = -sin_Omega * sin_omega + cos_Omega * cos_omega * cos_i
+    M31 = sin_omega * sin_i
+    M32 = cos_omega * sin_i
+    
+    # Position in TEME frame
+    x_teme = M11 * x_orb + M12 * y_orb
+    y_teme = M21 * x_orb + M22 * y_orb
+    z_teme = M31 * x_orb + M32 * y_orb
+    
+    # Velocity in TEME frame
+    vx_teme = M11 * rdot * cos_nu - M11 * rfdot * sin_nu + M12 * rdot * sin_nu + M12 * rfdot * cos_nu
+    vy_teme = M21 * rdot * cos_nu - M21 * rfdot * sin_nu + M22 * rdot * sin_nu + M22 * rfdot * cos_nu
+    vz_teme = M31 * rdot * cos_nu - M31 * rfdot * sin_nu + M32 * rdot * sin_nu + M32 * rfdot * cos_nu
+    
+    # Calculate derived orbital parameters for reporting
+    altitude = r - Constants.EARTH_RADIUS
+    velocity_magnitude = math.sqrt(vx_teme**2 + vy_teme**2 + vz_teme**2)
+    
+    return {
+        'position': [x_teme, y_teme, z_teme],
+        'velocity': [vx_teme, vy_teme, vz_teme],
+        'time': target_time,
+        'altitude': altitude,
+        'velocity_mag': velocity_magnitude,
+        'orbital_period': 2.0 * math.pi * math.sqrt(a0dp**3 / Constants.MU_EARTH) / 60.0  # minutes
+    }
+
+# =============================================================================
+# SECTION 4: LEO-SPECIFIC ANALYSIS AND REPORTING
+# =============================================================================
+
+def calculate_orbital_decay(tle_data):
+    """
+    Calculate orbital decay rate due to atmospheric drag.
+    
+    This is critical for LEO operations because it tells you how long until
+    the satellite needs a reboost maneuver or will reenter.
+    
+    Returns:
+        Decay rate in meters per day
+        
+    WHY THIS MATTERS:
+    Unlike GEO satellites that can stay on station for years, LEO satellites
+    are constantly fighting atmospheric drag. The ISS, for example, loses
+    about 100 meters of altitude per day and requires regular reboosts.
+    """
+    
+    # Mean motion derivative tells us how orbit period is changing
+    # Negative derivative means orbit is getting faster (lower altitude)
+    mean_motion_dot = tle_data['mean_motion_dot']
+    
+    # Convert to altitude decay rate
+    # Physics: as satellite slows due to drag, it drops to lower orbit
+    # Lower orbit = higher orbital velocity (counterintuitive but true!)
+    # Higher mean motion = shorter period = lower altitude
+    
+    n = tle_data['mean_motion'] * 2.0 * math.pi / Constants.MINUTES_PER_DAY
+    a = (Constants.MU_EARTH / (n * n)) ** (1.0/3.0)
+    
+    # Approximate decay rate (simplified model)
+    # In operational systems, this uses more sophisticated atmospheric models
+    if abs(mean_motion_dot) > 1e-10:
+        decay_rate_km_per_day = -2.0 * a * mean_motion_dot / (3.0 * tle_data['mean_motion'])
+        decay_rate_m_per_day = decay_rate_km_per_day * 1000.0
+    else:
+        decay_rate_m_per_day = 0.0
+    
+    return decay_rate_m_per_day
+
+def estimate_lifetime(tle_data, state_vector):
+    """
+    Estimate remaining orbital lifetime before atmospheric reentry.
+    
+    This is a critical safety parameter for LEO operations.
+    
+    WHY THIS MATTERS:
+    Space agencies must ensure controlled deorbit of satellites to prevent
+    uncontrolled reentry over populated areas. This calculation helps plan
+    end-of-life operations.
+    """
+    
+    decay_rate = calculate_orbital_decay(tle_data)
+    current_altitude = state_vector['altitude']
+    
+    # Assume satellite becomes uncontrollable below 150 km
+    critical_altitude = 150.0
+    
+    if decay_rate > 0.1:  # If measurable decay
+        altitude_to_lose = current_altitude - critical_altitude
+        days_remaining = altitude_to_lose / (decay_rate / 1000.0)
+        return days_remaining
+    else:
+        return float('inf')  # Effectively infinite (very high orbit or no drag)
+
+def generate_leo_report(tle_data, state_vector):
+    """
+    Generate comprehensive LEO satellite state report.
+    
+    This includes LEO-specific parameters like decay rate and reentry estimates
+    that aren't relevant for GEO satellites.
+    """
+    
+    pos = state_vector['position']
+    vel = state_vector['velocity']
+    
+    # Calculate additional parameters
+    r_mag = math.sqrt(pos[0]**2 + pos[1]**2 + pos[2]**2)
+    v_mag = state_vector['velocity_mag']
+    
+    decay_rate = calculate_orbital_decay(tle_data)
+    lifetime_days = estimate_lifetime(tle_data, state_vector)
+    
+    print("=" * 75)
+    print("LEO SATELLITE STATE VECTOR REPORT")
+    print("=" * 75)
+    print(f"Satellite: {tle_data['satellite_name']}")
+    print(f"Catalog #: {tle_data['catalog_number']}")
+    print(f"Epoch Time: {tle_data['epoch']}")
+    print(f"Propagated to: {state_vector['time']}")
+    print()
+    
+    print("POSITION (TEME Frame, km):")
+    print(f"  X: {pos[0]:15.3f}")
+    print(f"  Y: {pos[1]:15.3f}")
+    print(f"  Z: {pos[2]:15.3f}")
+    print(f"  Magnitude: {r_mag:15.3f} km")
+    print(f"  Altitude: {state_vector['altitude']:15.3f} km")
+    print()
+    
+    print("VELOCITY (TEME Frame, km/s):")
+    print(f"  Vx: {vel[0]:14.6f}")
+    print(f"  Vy: {vel[1]:14.6f}")
+    print(f"  Vz: {vel[2]:14.6f}")
+    print(f"  Magnitude: {v_mag:14.6f} km/s")
+    print()
+    
+    print("ORBITAL PARAMETERS:")
+    print(f"  Period: {state_vector['orbital_period']:12.2f} minutes")
+    print(f"  Inclination: {tle_data['inclination']:10.4f}°")
+    print(f"  Eccentricity: {tle_data['eccentricity']:10.7f}")
+    print()
+    
+    print("LEO-SPECIFIC PARAMETERS:")
+    print(f"  BSTAR (drag term): {tle_data['bstar']:15.9e}")
+    print(f"  Altitude decay rate: {decay_rate:10.2f} m/day")
+    if lifetime_days < 1000:
+        print(f"  Estimated lifetime: {lifetime_days:10.1f} days")
+    else:
+        print(f"  Estimated lifetime: >1000 days (negligible decay)")
+    print()
+    
+    print("ASSESSMENT:")
+    # Check if altitude is in typical LEO range
+    if 200 < state_vector['altitude'] < 2000:
+        print("  ✓ Altitude consistent with Low Earth Orbit")
+    elif state_vector['altitude'] < 200:
+        print("  ⚠ WARNING: Very low altitude - reentry risk!")
+    else:
+        print("  ⚠ WARNING: Altitude above typical LEO range")
+    
+    # Check velocity
+    if 7.0 < v_mag < 8.0:
+        print("  ✓ Velocity consistent with LEO orbital speed")
+    else:
+        print("  ⚠ WARNING: Velocity outside nominal LEO range")
+    
+    # Decay warning
+    if decay_rate > 50:
+        print("  ⚠ WARNING: High decay rate - reboost may be needed soon")
+    elif decay_rate > 10:
+        print("  ⚠ NOTICE: Moderate decay rate - monitor closely")
+    else:
+        print("  ✓ Decay rate nominal")
+    
+    print("=" * 75)
+
+# =============================================================================
+# MAIN PROCEDURE EXECUTION
+# =============================================================================
+
+if __name__ == "__main__":
+    """
+    Main execution demonstrating LEO satellite tracking.
+    
+    This uses real ISS TLE data format as an example.
+    """
+    
+    print("LEO SATELLITE ORBITAL STATE DETERMINATION")
+    print("Standard: ESA/NASA Mission Operations - SGP4 Algorithm\n")
+    
+    # EXAMPLE: International Space Station TLE (example format)
+    # In operations, you'd fetch current TLE from Space-Track.org or Celestrak
+    TLE_LINE0 = "ISS (ZARYA)"
+    TLE_LINE1 = "1 25544U 98067A   25277.50000000  .00016717  00000-0  10270-3 0  9005"
+    TLE_LINE2 = "2 25544  51.6400 247.4627 0001320  84.5100 275.6300 15.50030060123456"
+    
+    print("Step 1: Parsing TLE data for LEO satellite...")
+    tle_data = parse_leo_tle(TLE_LINE0, TLE_LINE1, TLE_LINE2)
+    print(f"  Satellite: {tle_data['satellite_name']}")
+    print(f"  Epoch: {tle_data['epoch']}")
+    print(f"  Mean Motion: {tle_data['mean_motion']:.8f} rev/day")
+    print(f"  BSTAR (drag): {tle_data['bstar']:.6e}")
+    print()
+    
+    print("Step 2: Propagating orbit using SGP4...")
+    current_time = datetime.utcnow()
+    state_vector = sgp4_propagate(tle_data, current_time)
+    print("  SGP4 propagation complete.")
+    print()
+    
+    print("Step 3: Generating LEO-specific analysis...")
+    generate_leo_report(tle_data, state_vector)
+    
+    print("\n✓ PROCEDURE COMPLETE")
+    print("\nNEXT STEPS FOR LEO OPERATIONS:")
+    print("- Monitor altitude decay rate")
+    print("- Plan reboost maneuver if decay exceeds threshold")
+    print("- Update collision avoidance screening")
+    print("- Verify ground station pass predictions")
